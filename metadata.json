@@ -1,0 +1,6 @@
+{
+  "name": "يمن فورجي",
+  "description": "تطبيق الاستعلام عن رصيد وباقات مودم يمن فورجي وتتبع الاستهلاك الرسمي - برمجة وتصميم هاشم القديمي",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
