@@ -20,8 +20,38 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Initialize Android SDK Tools
-        uses: android-actions/setup-android@v3
+      - name: Configure Android SDK Tools
+        run: |
+          ANDROID_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_ROOT" >> $GITHUB_ENV
+
+          # Add pre-installed cmdline-tools and platform-tools to PATH
+          for bin_dir in \
+            "$ANDROID_ROOT/cmdline-tools/latest/bin" \
+            "$ANDROID_ROOT/cmdline-tools/16.0/bin" \
+            "$ANDROID_ROOT/cmdline-tools/12.0/bin" \
+            "$ANDROID_ROOT/cmdline-tools/9.0/bin" \
+            "$ANDROID_ROOT/tools/bin" \
+            "$ANDROID_ROOT/platform-tools"; do
+            if [ -d "$bin_dir" ]; then
+              echo "$bin_dir" >> $GITHUB_PATH
+              echo "Added $bin_dir to PATH"
+            fi
+          done
+
+      - name: Ensure sdkmanager is available
+        run: |
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            echo "sdkmanager not found in standard paths, downloading official command-line tools..."
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -sSLo /tmp/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q -o /tmp/cmdline-tools.zip -d /tmp/cmdline-tools-extracted
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mv /tmp/cmdline-tools-extracted/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+            echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+            echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          fi
 
       - name: Verify and Install Android SDK Packages
         run: |
@@ -84,7 +114,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.1-${{ github.run_number }}
+          tag_name: v1.0.2-${{ github.run_number }}
           name: "يمن فورجي - النسخة التجريبية ${{ github.run_number }}"
           body: |
             نسخة APK تجريبية مبنية تلقائياً عبر GitHub Actions.
