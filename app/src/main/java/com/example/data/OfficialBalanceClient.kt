@@ -3,6 +3,7 @@ package com.example.data
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.text.Html
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -14,11 +15,27 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.security.cert.CertificateException
+import javax.net.ssl.SSLException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
 data class OfficialBalanceRow(val label: String, val value: String)
 data class OfficialBalanceResult(val rows: List<OfficialBalanceRow>, val dataRemaining: String?)
+
+private enum class CaptchaStage(val label: String) {
+    PAGE("فتح صفحة الاستعلام"),
+    FORM("قراءة النموذج والحقول"),
+    SOURCE("التحقق من رابط الكابتشا"),
+    IMAGE("تحميل صورة الكابتشا"),
+    DECODE("قراءة الصورة وعرضها")
+}
+
+private class SafePortalFailure(val detail: String) : IOException()
+private class CaptchaDiagnostic(val stage: CaptchaStage, val detail: String) : IOException()
 
 /**
  * Protocol observed in the user's before/after MHTML captures.
@@ -62,9 +79,12 @@ class OfficialBalanceClient {
     }
 
     suspend fun loadCaptcha(): Bitmap = withContext(Dispatchers.IO) {
+        var stage = CaptchaStage.PAGE
+        try {
         clear()
         val page = String(fetch(request(portal).build()), Charsets.UTF_8)
         coroutineContext.ensureActive()
+        stage = CaptchaStage.FORM
         val form = blocks(page, "form").firstOrNull { block ->
             attribute(block, "id") == "qbill_formnew"
         } ?: throw IOException("نموذج الموقع غير متاح أو تغيّر. لم يتم إرسال رقم.")
@@ -78,6 +98,7 @@ class OfficialBalanceClient {
             !inputs.any { attribute(it, "name") == "qsubmitnew" }) {
             throw IOException("حقول النموذج الرسمي تغيّرت؛ يلزم تحديث الربط.")
         }
+        stage = CaptchaStage.SOURCE
         val image = Regex("<img\\b[^>]*>", options).findAll(form).map { it.value }
             .firstOrNull { attribute(it, "id") == "qp4g-captcha_img" }
         if (image == null || attribute(image, "src") != captchaUrl) {
@@ -86,8 +107,10 @@ class OfficialBalanceClient {
         hiddenFields = inputs.filter { attribute(it, "type")?.lowercase() == "hidden" }
             .mapNotNull { input -> attribute(input, "name")?.let { it to (attribute(input, "value") ?: "") } }
             .toMap()
+        stage = CaptchaStage.IMAGE
         val bytes = fetch(request("$captchaUrl&t=${System.currentTimeMillis()}").build())
         coroutineContext.ensureActive()
+        stage = CaptchaStage.DECODE
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         if (bounds.outWidth !in 1..2048 || bounds.outHeight !in 1..1024) {
@@ -95,6 +118,26 @@ class OfficialBalanceClient {
         }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             ?: throw IOException("تعذّر عرض صورة الكابتشا الرسمية.")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val detail = when (e) {
+                is SafePortalFailure -> e.detail
+                is SSLException, is CertificateException ->
+                    "فشل التحقق من اتصال HTTPS أو شهادة الموقع. لم يتم تجاوز الأمان."
+                is UnknownHostException -> "تعذّر العثور على عنوان خادم الموقع (DNS)."
+                is SocketTimeoutException -> "انتهت مهلة الاتصال قبل اكتمال هذه المرحلة."
+                is ConnectException -> "تعذّر إنشاء اتصال بالخادم."
+                else -> when (stage) {
+                    CaptchaStage.FORM -> "النموذج أو وجهته أو حقوله لا تطابق البنية التي تم التحقق منها."
+                    CaptchaStage.SOURCE -> "رابط صورة الكابتشا غائب أو لا يطابق المصدر الرسمي المتوقع."
+                    CaptchaStage.DECODE -> "الاستجابة ليست صورة قابلة للعرض، أو أبعادها خارج الحد المسموح."
+                    else -> "توقّف اتصال الشبكة أو لم تكتمل قراءة الاستجابة."
+                }
+            }
+            // No raw exception message, response body, URL, headers or cookie values.
+            throw CaptchaDiagnostic(stage, detail)
+        }
     }
 
     suspend fun query(number: String, code: String): OfficialBalanceResult = withContext(Dispatchers.IO) {
@@ -120,16 +163,21 @@ class OfficialBalanceClient {
     private fun fetch(request: Request): ByteArray {
         // Never follow redirects: the subscriber is sent only to the verified HTTPS endpoint.
         client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("لم يستجب الموقع الرسمي بنجاح. حاول لاحقًا.")
-            val body = response.body ?: throw IOException("استجابة الموقع فارغة.")
-            if (body.contentLength() > 1_048_576) throw IOException("استجابة الموقع أكبر من المتوقع.")
+            if (response.code in 300..399) {
+                throw SafePortalFailure("أعاد الخادم تحويلًا للرابط (HTTP ${response.code}). التطبيق لم يتبعه؛ يلزم التحقق من وجهته.")
+            }
+            if (!response.isSuccessful) {
+                throw SafePortalFailure("رفض الخادم الطلب أو تعذّر تنفيذه (HTTP ${response.code}).")
+            }
+            val body = response.body ?: throw SafePortalFailure("وصلت استجابة بلا محتوى.")
+            if (body.contentLength() > 1_048_576) throw SafePortalFailure("حجم الاستجابة تجاوز الحد الآمن.")
             val output = ByteArrayOutputStream()
             body.byteStream().use { stream ->
                 val buffer = ByteArray(8192)
                 while (true) {
                     val count = stream.read(buffer)
                     if (count < 0) break
-                    if (output.size() + count > 1_048_576) throw IOException("استجابة الموقع أكبر من المتوقع.")
+                    if (output.size() + count > 1_048_576) throw SafePortalFailure("حجم الاستجابة تجاوز الحد الآمن.")
                     output.write(buffer, 0, count)
                 }
             }
@@ -138,6 +186,11 @@ class OfficialBalanceClient {
     }
 
     companion object {
+        fun captchaFailureMessage(error: Exception): String {
+            val diagnosis = error as? CaptchaDiagnostic
+                ?: return "تعذّر تحميل الكابتشا. فشل غير مصنّف؛ حاول التحديث."
+            return "فشل الكابتشا في مرحلة: ${diagnosis.stage.label}\n${diagnosis.detail}\nرمز التشخيص: CAPTCHA_${diagnosis.stage.name}\nلا يحتوي هذا التشخيص على رقمك أو بيانات الجلسة."
+        }
         private val options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
         private fun blocks(html: String, tag: String) =
             Regex("<$tag\\b[^>]*>.*?</$tag\\s*>", options).findAll(html).map { it.value }.toList()

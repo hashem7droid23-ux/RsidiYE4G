@@ -118,7 +118,7 @@ private fun BalanceInquiryApp(session: InquirySession) {
                 throw e
             } catch (e: Exception) {
                 if (generation == session.generation) {
-                    session.error = "تعذّر تحميل الكابتشا بأمان من الموقع الرسمي. تحقّق من الاتصال ثم أعد المحاولة."
+                    session.error = OfficialBalanceClient.captchaFailureMessage(e)
                 }
             } finally {
                 if (generation == session.generation) session.busy = false
