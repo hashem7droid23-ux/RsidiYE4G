@@ -7,17 +7,16 @@ import com.example.model.SubscriberAccount
 import com.example.model.Yemen4GBalance
 import com.example.model.Yemen4GPackage
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import kotlin.random.Random
 
 class Yemen4GRepository(private val context: Context) {
 
@@ -25,110 +24,49 @@ class Yemen4GRepository(private val context: Context) {
         context.getSharedPreferences("yemen4g_prefs", Context.MODE_PRIVATE)
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
 
-    private var currentCaptchaCode: String = generateRandomCaptcha()
-
-    fun getCurrentCaptcha(): String = currentCaptchaCode
-
-    fun regenerateCaptcha(): String {
-        currentCaptchaCode = generateRandomCaptcha()
-        return currentCaptchaCode
+    /**
+     * Checks real live connectivity to the official Yemen Telecom portal (https://svc.ptc.gov.ye/4g/)
+     * without fabricating fake balances.
+     */
+    suspend fun verifyOfficialPortalConnection(): Result<Boolean> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("https://svc.ptc.gov.ye/4g/")
+                .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
+                .build()
+            val response = httpClient.newCall(request).execute()
+            val isSuccess = response.isSuccessful || response.code in 200..399
+            response.close()
+            Result.success(isSuccess)
+        } catch (e: IOException) {
+            Result.failure(e)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
-    private fun generateRandomCaptcha(): String {
-        val chars = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
-        return (1..5)
-            .map { chars[Random.nextInt(chars.length)] }
-            .joinToString("")
-    }
-
-    suspend fun queryBalance(modemNumber: String, enteredCaptcha: String): Result<Yemen4GBalance> =
+    suspend fun checkAccountAndPrepareOfficialQuery(modemNumber: String): Result<SubscriberAccount> =
         withContext(Dispatchers.IO) {
             val cleanNumber = modemNumber.trim().replace(" ", "").replace("-", "")
 
-            // 1. Basic validation
             if (cleanNumber.length < 8 || cleanNumber.length > 11) {
                 return@withContext Result.failure(
                     IllegalArgumentException("رقم المودم غير صحيح، يرجى إدخال رقم يمن فورجي مكون من 9 إلى 10 أرقام (يبدأ بـ 1)")
                 )
             }
 
-            // 2. Validate Captcha
-            if (!enteredCaptcha.equals(currentCaptchaCode, ignoreCase = true)) {
-                // Regenerate for security
-                regenerateCaptcha()
-                return@withContext Result.failure(
-                    IllegalArgumentException("رمز التحقق (الكابتشا) غير متطابق، تم توليد رمز جديد يرجى إدخاله مجدداً")
-                )
-            }
-
-            // 3. Attempt direct network reach to the official portal
-            val isOfficialOnline = try {
-                val request = Request.Builder()
-                    .url("https://svc.ptc.gov.ye/4g/")
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36")
-                    .build()
-                val response = httpClient.newCall(request).execute()
-                val code = response.code
-                response.close()
-                code in 200..399
-            } catch (e: Exception) {
-                false
-            }
-
-            // Always provide realistic simulated/derived data for the number
-            // Deterministic calculation based on modem number so repeated queries show consistent balance
-            val seed = cleanNumber.fold(0L) { acc, c -> acc * 31 + c.code }
-            val rng = Random(seed)
-
-            val packageOptions = listOf(
-                Pair("باقة سوبر فورجي 80 جيجا", 80.0),
-                Pair("باقة ماكس فورجي 150 جيجا", 150.0),
-                Pair("باقة التوفير 35 جيجا", 35.0),
-                Pair("باقة الأعمال 250 جيجا", 250.0),
-                Pair("باقة البداية 15 جيجا", 15.0)
+            val account = SubscriberAccount(
+                number = cleanNumber,
+                label = "مودم $cleanNumber",
+                lastChecked = System.currentTimeMillis()
             )
-
-            val chosenPkg = packageOptions[rng.nextInt(packageOptions.size)]
-            val totalGb = chosenPkg.second
-            val usedFraction = 0.25 + (rng.nextDouble() * 0.60) // 25% to 85% used
-            val usedGb = String.format(Locale.US, "%.2f", totalGb * usedFraction).toDouble()
-            val remainingGb = String.format(Locale.US, "%.2f", totalGb - usedGb).toDouble()
-            val daysLeft = rng.nextInt(3, 26)
-
-            val dateFormat = SimpleDateFormat("yyyy/MM/dd", Locale.US)
-            val expiryMillis = System.currentTimeMillis() + (daysLeft.toLong() * 24 * 60 * 60 * 1000)
-            val expiryDateStr = dateFormat.format(Date(expiryMillis))
-
-            val timeFormat = SimpleDateFormat("yyyy/MM/dd - hh:mm a", Locale.forLanguageTag("ar"))
-            val queryTime = timeFormat.format(Date())
-
-            // Regenerate captcha for next time
-            regenerateCaptcha()
-
-            val balance = Yemen4GBalance(
-                accountNumber = cleanNumber,
-                subscriberName = "مشترك يمن فورجي (${cleanNumber.takeLast(4)})",
-                packageName = chosenPkg.first,
-                totalGigabytes = totalGb,
-                remainingGigabytes = remainingGb,
-                usedGigabytes = usedGb,
-                expirationDate = expiryDateStr,
-                daysRemaining = daysLeft,
-                status = "نشط ومفعل",
-                balanceYer = (rng.nextInt(1, 15) * 100).toDouble(),
-                queryTimestamp = queryTime,
-                isOfficialServerVerified = isOfficialOnline
-            )
-
-            // Save number to recent accounts
-            saveAccount(SubscriberAccount(cleanNumber, "مودم $cleanNumber"))
-
-            Result.success(balance)
+            saveAccount(account)
+            Result.success(account)
         }
 
     fun getSavedAccounts(): List<SubscriberAccount> {
@@ -153,16 +91,14 @@ class Yemen4GRepository(private val context: Context) {
     }
 
     private fun defaultAccounts(): List<SubscriberAccount> = listOf(
-        SubscriberAccount("100234567", "مودم المنزل"),
-        SubscriberAccount("101987654", "مودم المكتب"),
-        SubscriberAccount("102456789", "مودم المحل")
+        SubscriberAccount("100234567", "مودم تجريبي")
     )
 
     fun saveAccount(account: SubscriberAccount) {
         val current = getSavedAccounts().toMutableList()
         current.removeAll { it.number == account.number }
         current.add(0, account)
-        val limited = current.take(8)
+        val limited = current.take(10)
 
         val jsonArray = JSONArray()
         for (acc in limited) {

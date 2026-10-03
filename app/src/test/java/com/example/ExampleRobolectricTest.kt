@@ -23,15 +23,15 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `test repository packages and captcha generation`() {
+    fun `test repository packages and routers data`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val repository = Yemen4GRepository(context)
-        val captcha = repository.getCurrentCaptcha()
-        assertNotNull(captcha)
-        assertEquals(5, captcha.length)
 
         val packages = repository.getOfficialPackages()
         assertTrue(packages.isNotEmpty())
         assertTrue(packages.any { it.isPopular })
+
+        val routers = repository.getModemRouters()
+        assertTrue(routers.isNotEmpty())
     }
 }

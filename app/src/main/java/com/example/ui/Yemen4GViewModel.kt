@@ -10,9 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.Yemen4GRepository
 import com.example.model.ModemGatewayInfo
-import com.example.model.QueryUiState
 import com.example.model.SubscriberAccount
-import com.example.model.Yemen4GBalance
 import com.example.model.Yemen4GPackage
 import com.example.model.Yemen4GScreen
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,18 +19,21 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+sealed interface ConnectionCheckState {
+    data object Idle : ConnectionCheckState
+    data object Checking : ConnectionCheckState
+    data class Connected(val message: String, val checkedAt: Long = System.currentTimeMillis()) : ConnectionCheckState
+    data class Failed(val error: String, val checkedAt: Long = System.currentTimeMillis()) : ConnectionCheckState
+}
+
 data class Yemen4GMainUiState(
     val currentScreen: Yemen4GScreen = Yemen4GScreen.INQUIRY,
     val modemNumber: String = "",
-    val captchaInput: String = "",
-    val activeCaptchaCode: String = "",
-    val isRefreshingCaptcha: Boolean = false,
-    val queryState: QueryUiState = QueryUiState.Idle,
+    val connectionState: ConnectionCheckState = ConnectionCheckState.Idle,
     val savedAccounts: List<SubscriberAccount> = emptyList(),
     val packages: List<Yemen4GPackage> = emptyList(),
     val routers: List<ModemGatewayInfo> = emptyList(),
-    val selectedPackageForCalc: Yemen4GPackage? = null,
-    val showSaveAccountDialog: Boolean = false
+    val selectedPackageForCalc: Yemen4GPackage? = null
 )
 
 class Yemen4GViewModel(application: Application) : AndroidViewModel(application) {
@@ -41,7 +42,6 @@ class Yemen4GViewModel(application: Application) : AndroidViewModel(application)
 
     private val _uiState = MutableStateFlow(
         Yemen4GMainUiState(
-            activeCaptchaCode = repository.getCurrentCaptcha(),
             savedAccounts = repository.getSavedAccounts(),
             packages = repository.getOfficialPackages(),
             routers = repository.getModemRouters(),
@@ -59,85 +59,60 @@ class Yemen4GViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(modemNumber = filtered) }
     }
 
-    fun onCaptchaChange(captcha: String) {
-        val filtered = captcha.uppercase().filter { it.isLetterOrDigit() }.take(5)
-        _uiState.update { it.copy(captchaInput = filtered) }
-    }
-
-    fun refreshCaptcha() {
-        val newCode = repository.regenerateCaptcha()
-        _uiState.update {
-            it.copy(
-                activeCaptchaCode = newCode,
-                captchaInput = ""
-            )
-        }
-    }
-
     fun selectAccount(account: SubscriberAccount) {
-        _uiState.update {
-            it.copy(
-                modemNumber = account.number,
-                captchaInput = ""
-            )
-        }
+        _uiState.update { it.copy(modemNumber = account.number) }
     }
 
-    fun loadQuickDemo() {
-        val demoNumbers = listOf("100889922", "101445566", "102773311")
-        val chosen = demoNumbers.random()
-        _uiState.update {
-            it.copy(
-                modemNumber = chosen,
-                captchaInput = it.activeCaptchaCode
-            )
-        }
-        executeQuery()
-    }
-
-    fun executeQuery() {
+    fun verifyAndOpenOfficialPortal() {
         val number = _uiState.value.modemNumber.trim()
-        val captcha = _uiState.value.captchaInput.trim()
-
-        if (number.isEmpty()) {
+        if (number.length < 8) {
             _uiState.update {
                 it.copy(
-                    queryState = QueryUiState.Error("يرجى إدخال رقم هاتف أو مودم يمن فورجي (يبدأ بـ 1)")
-                )
-            }
-            return
-        }
-
-        if (captcha.isEmpty()) {
-            _uiState.update {
-                it.copy(
-                    queryState = QueryUiState.Error("يرجى كتابة رمز التحقق (الكابتشا) الظاهر في الصورة")
+                    connectionState = ConnectionCheckState.Failed(
+                        "يرجى إدخال رقم مودم يمن فورجي صحيح (9 إلى 10 أرقام) قبل الانتقال للبوابة"
+                    )
                 )
             }
             return
         }
 
         viewModelScope.launch {
-            _uiState.update { it.copy(queryState = QueryUiState.Loading) }
+            _uiState.update { it.copy(connectionState = ConnectionCheckState.Checking) }
 
-            val result = repository.queryBalance(number, captcha)
-            result.fold(
-                onSuccess = { balance ->
-                    _uiState.update {
-                        it.copy(
-                            queryState = QueryUiState.Success(balance),
-                            savedAccounts = repository.getSavedAccounts(),
-                            activeCaptchaCode = repository.getCurrentCaptcha(),
-                            captchaInput = ""
-                        )
+            // Save account
+            repository.saveAccount(SubscriberAccount(number, "مودم $number"))
+            _uiState.update { it.copy(savedAccounts = repository.getSavedAccounts()) }
+
+            val connResult = repository.verifyOfficialPortalConnection()
+            connResult.fold(
+                onSuccess = { isOnline ->
+                    if (isOnline) {
+                        _uiState.update {
+                            it.copy(
+                                connectionState = ConnectionCheckState.Connected(
+                                    "خادم المؤسسة العامة للاتصالات (svc.ptc.gov.ye) متصل وجاهز للاستعلام الرسمي المباشر."
+                                ),
+                                currentScreen = Yemen4GScreen.OFFICIAL_PORTAL
+                            )
+                        }
+                    } else {
+                        _uiState.update {
+                            it.copy(
+                                connectionState = ConnectionCheckState.Failed(
+                                    "خادم البوابة الرسمية لم يستجب برمز نجاح، يمكنك تجربة فتح البوابة مباشرة عبر المتصفح المدمج."
+                                ),
+                                currentScreen = Yemen4GScreen.OFFICIAL_PORTAL
+                            )
+                        }
                     }
                 },
-                onFailure = { error ->
+                onFailure = { err ->
                     _uiState.update {
                         it.copy(
-                            queryState = QueryUiState.Error(error.localizedMessage ?: "فشل الاستعلام"),
-                            activeCaptchaCode = repository.getCurrentCaptcha(),
-                            captchaInput = ""
+                            connectionState = ConnectionCheckState.Failed(
+                                "تعذر الوصول المباشر لخوادم الاتصالات (قد يكون بسبب الحظر الجغرافي لخوادم اليمن أو بطء الشبكة). سيتم فتح المتصفح المدمج الآن لتجاوز أي قيود شبكة."
+                            ),
+                            currentScreen = Yemen4GScreen.OFFICIAL_PORTAL
                         )
                     }
                 }
@@ -145,74 +120,45 @@ class Yemen4GViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun dismissError() {
-        _uiState.update { it.copy(queryState = QueryUiState.Idle) }
-    }
-
-    fun resetQuery() {
-        _uiState.update {
-            it.copy(
-                queryState = QueryUiState.Idle,
-                captchaInput = "",
-                activeCaptchaCode = repository.regenerateCaptcha()
+    fun checkServerOnly() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(connectionState = ConnectionCheckState.Checking) }
+            val connResult = repository.verifyOfficialPortalConnection()
+            connResult.fold(
+                onSuccess = { isOnline ->
+                    _uiState.update {
+                        it.copy(
+                            connectionState = if (isOnline) {
+                                ConnectionCheckState.Connected("سيرفر يمن فورجي الرسمي (svc.ptc.gov.ye/4g/) متصل ومتاح حالياً.")
+                            } else {
+                                ConnectionCheckState.Failed("سيرفر يمن فورجي الرسمي لا يستجيب في الوقت الحالي.")
+                            }
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            connectionState = ConnectionCheckState.Failed(
+                                "فشل الاتصال بسيرفر الاتصالات: ${err.localizedMessage ?: "مهلة الاتصال انتهت"}"
+                            )
+                        )
+                    }
+                }
             )
         }
+    }
+
+    fun dismissConnectionState() {
+        _uiState.update { it.copy(connectionState = ConnectionCheckState.Idle) }
     }
 
     fun selectPackageForCalc(pkg: Yemen4GPackage) {
         _uiState.update { it.copy(selectedPackageForCalc = pkg) }
     }
 
-    fun saveAccountWithLabel(number: String, label: String) {
-        if (number.isNotBlank()) {
-            repository.saveAccount(SubscriberAccount(number, label.ifBlank { "مودم $number" }))
-            _uiState.update { it.copy(savedAccounts = repository.getSavedAccounts()) }
-        }
-    }
-
     fun deleteAccount(number: String) {
         repository.removeAccount(number)
         _uiState.update { it.copy(savedAccounts = repository.getSavedAccounts()) }
-    }
-
-    fun copyToClipboard(context: Context, balance: Yemen4GBalance) {
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val text = buildString {
-            appendLine("📶 تقرير رصيد يمن فورجي الرسمي 📶")
-            appendLine("رقم المودم: ${balance.accountNumber}")
-            appendLine("الباقة الحالية: ${balance.packageName}")
-            appendLine("الرصيد المتبقي: ${balance.remainingGigabytes} جيجابايت")
-            appendLine("الرصيد المستهلك: ${balance.usedGigabytes} جيجابايت من أصل ${balance.totalGigabytes} جيجابايت")
-            appendLine("تاريخ الانتهاء: ${balance.expirationDate} (متبقي ${balance.daysRemaining} يوم)")
-            appendLine("الحالة: ${balance.status}")
-            appendLine("تاريخ الاستعلام: ${balance.queryTimestamp}")
-            appendLine("---")
-            appendLine("تم الاستعلام عبر تطبيق يمن فورجي")
-            appendLine("برمجة وتصميم: هاشم القديمي")
-        }
-        val clip = ClipData.newPlainText("Yemen4G Balance", text)
-        clipboard.setPrimaryClip(clip)
-        Toast.makeText(context, "تم نسخ تفاصيل الرصيد بنجاح", Toast.LENGTH_SHORT).show()
-    }
-
-    fun shareBalance(context: Context, balance: Yemen4GBalance) {
-        val text = buildString {
-            appendLine("📶 استعلام رصيد يمن فورجي 📶")
-            appendLine("رقم المشترك: ${balance.accountNumber}")
-            appendLine("الباقة: ${balance.packageName}")
-            appendLine("الرصيد المتبقي: ${balance.remainingGigabytes} GB / ${balance.totalGigabytes} GB")
-            appendLine("تاريخ الانتهاء: ${balance.expirationDate} (باقي ${balance.daysRemaining} يوم)")
-            appendLine("---")
-            appendLine("برمجة وتصميم: هاشم القديمي")
-        }
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "رصيد يمن فورجي - ${balance.accountNumber}")
-            putExtra(Intent.EXTRA_TEXT, text)
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        }
-        context.startActivity(Intent.createChooser(intent, "مشاركة الرصيد عبر").apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        })
     }
 }
